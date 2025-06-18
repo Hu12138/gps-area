@@ -7,18 +7,32 @@ import alphashape
 
 app = Flask(__name__)
 
-class SimpleAreaCalculator:
-    def __init__(self, density_radius=5, min_points=20, alpha=0.05, simplify_tolerance=2.0):
+
+class OptimizedAreaCalculator:
+    def __init__(self, density_radius=5, min_points=20, alpha=0.05,
+                 simplify_tolerance=2.0, offset_distance=3,
+                 extend_main_direction=True, extend_other_directions=True):
         self.transformer_to_proj = Transformer.from_crs("EPSG:4326", "EPSG:3410", always_xy=True)
         self.transformer_to_gps = Transformer.from_crs("EPSG:3410", "EPSG:4326", always_xy=True)
         self.density_radius = density_radius
         self.min_points = min_points
         self.alpha = alpha
         self.simplify_tolerance = simplify_tolerance
+        self.offset_distance = offset_distance
+
+        self.extend_main_direction = extend_main_direction
+        self.extend_other_directions = extend_other_directions
+
+        self.base_directions = np.array([
+            [1, 0], [0, 1], [-1, 0], [0, -1],
+            [1, 1], [-1, -1], [1, -1], [-1, 1]
+        ])
+        self.norm_directions = self.base_directions / np.linalg.norm(self.base_directions, axis=1, keepdims=True)
 
     def calculate_work_areas(self, points):
-        proj_points = np.array([self.transformer_to_proj.transform(float(lon), float(lat)) for lon, lat in points])
-        clusters = self._density_clustering(proj_points)
+        proj_points = np.array([self.transformer_to_proj.transform(lon, lat) for lon, lat in points])
+        extended_points = self._add_direction_aware_points(proj_points)
+        clusters = self._density_clustering(extended_points)
 
         polygons = []
         for cluster in clusters:
@@ -35,7 +49,7 @@ class SimpleAreaCalculator:
             area = shapely_poly.area
             if area > 100:
                 centroid = shapely_poly.centroid
-                lon, lat = self._centroid_to_gps(centroid.x, centroid.y)
+                lon, lat = self.transformer_to_gps.transform(centroid.x, centroid.y)
                 results.append({
                     "area_m2": area,
                     "point_count": len(poly),
@@ -45,9 +59,33 @@ class SimpleAreaCalculator:
 
         return results, total_area
 
-    def _centroid_to_gps(self, x, y):
-        lon, lat = self.transformer_to_gps.transform(x, y)
-        return lon, lat
+    def _add_direction_aware_points(self, points, angle_cos_threshold=0.96, max_gap=3.0):
+        extended = [points[0]]
+        for i in range(1, len(points) - 1):
+            p0, p1, p2 = points[i - 1], points[i], points[i + 1]
+            v1 = p1 - p0
+            v2 = p2 - p1
+            norm1 = np.linalg.norm(v1)
+            norm2 = np.linalg.norm(v2)
+
+            if norm1 < 1e-6 or norm2 < 1e-6:
+                extended.append(p1)
+                continue
+
+            cos_angle = np.dot(v1, v2) / (norm1 * norm2)
+            extended.append(p1)
+
+            if cos_angle > angle_cos_threshold:
+                total_dist = np.linalg.norm(p2 - p0)
+                if total_dist > max_gap:
+                    num_extra = int(total_dist // self.offset_distance)
+                    direction = (p2 - p0) / total_dist
+                    for j in range(1, num_extra):
+                        interp_point = p0 + direction * j * self.offset_distance
+                        extended.append(interp_point)
+
+        extended.append(points[-1])
+        return np.array(extended)
 
     def _density_clustering(self, points):
         db = DBSCAN(eps=self.density_radius, min_samples=self.min_points).fit(points)
@@ -56,7 +94,7 @@ class SimpleAreaCalculator:
             if label == -1:
                 continue
             cluster = points[db.labels_ == label]
-            if len(cluster) >= self.min_points:
+            if len(cluster) >= 3:
                 clusters.append(cluster)
         return clusters
 
@@ -67,6 +105,7 @@ class SimpleAreaCalculator:
             return np.array(simplified.exterior.coords)
         return []
 
+
 @app.route('/calculate_plowing_area', methods=['POST'])
 def calculate_area():
     data = request.get_json()
@@ -74,8 +113,16 @@ def calculate_area():
         return jsonify({"status": "error", "message": "Missing 'points' in request"}), 400
 
     try:
-        points = data['points']
-        calculator = SimpleAreaCalculator(density_radius=5, min_points=10, alpha=0.3)
+        points = data['points']  # list of [lon, lat]
+        calculator = OptimizedAreaCalculator(
+            density_radius=5,
+            min_points=15,
+            alpha=0.3,
+            simplify_tolerance=2,
+            offset_distance=2,
+            extend_main_direction=True,
+            extend_other_directions=False  # 可以改为 True
+        )
         field_data, total_area = calculator.calculate_work_areas(points)
 
         fields = {}
@@ -96,9 +143,10 @@ def calculate_area():
         }
 
         return jsonify(response)
-    
+
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000)

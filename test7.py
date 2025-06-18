@@ -86,7 +86,7 @@ class SimpleAreaCalculator:
 # ✅ 示例使用
 if __name__ == "__main__":
     from getData import getData  # 你的 JSON 解析函数
-    gps_points = getData("data/test1.json")
+    gps_points = getData("data/bug.json")
 
     calculator = SimpleAreaCalculator(
         density_radius=15,
