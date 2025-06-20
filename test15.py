@@ -1,202 +1,192 @@
 import numpy as np
+from sklearn.cluster import DBSCAN
+from shapely.geometry import Polygon
+import alphashape
 import matplotlib.pyplot as plt
-from math import degrees
 import matplotlib
-
+from pyproj import Transformer
+import hdbscan
 matplotlib.rcParams['font.sans-serif'] = ['PingFang HK', 'Arial Unicode MS', 'SimHei']
 matplotlib.rcParams['axes.unicode_minus'] = False
 
+class AutoSpatialGrouper:
+    def __init__(self, 
+                 group_min_size=50,      # HDBSCAN最小簇大小
+                 group_cluster_size=30,  # HDBSCAN簇大小参数
+                 density_radius=5,       # DBSCAN半径
+                 min_points=15,          # DBSCAN最小点数
+                 alpha=0.3,              # Alpha shape参数
+                 simplify_tolerance=2,   # 简化阈值
+                 offset_distance=2):     # 插值距离
+        self.transformer = Transformer.from_crs("EPSG:4326", "EPSG:3410", always_xy=True)
+        self.group_min_size = group_min_size
+        self.group_cluster_size = group_cluster_size
+        self.density_radius = density_radius
+        self.min_points = min_points
+        self.alpha = alpha
+        self.simplify_tolerance = simplify_tolerance
+        self.offset_distance = offset_distance
 
-# ------------------ 工具函数 ------------------
+    def calculate_work_areas(self, points, visualize=False):
+        print("=== 开始处理 ===")
+        print(f"原始数据点数量: {len(points)}")
+        
+        # 坐标转换
+        proj_points = np.array([self.transformer.transform(lon, lat) for lon, lat in points])
+        print("坐标转换完成")
+        
+        # 自动空间分组
+        print("\n进行自动空间分组...")
+        groups = self._auto_spatial_grouping(proj_points)
+        print(f"自动分成 {len(groups)} 个空间组")
+        for i, group in enumerate(groups, 1):
+            print(f"  第{i}组: {len(group)} 个点")
+        
+        # 处理每组数据
+        all_polygons = []
+        for i, group in enumerate(groups, 1):
+            print(f"\n处理第{i}组 ({len(group)}点)...")
+            
+            # 插值增强
+            extended_points = self._add_direction_aware_points(group)
+            print(f"  插值后: {len(extended_points)}点")
+            
+            # 密度聚类
+            clusters = self._density_clustering(extended_points)
+            print(f"  找到子聚类: {len(clusters)}个")
+            
+            # 生成多边形
+            for j, cluster in enumerate(clusters, 1):
+                if len(cluster) < 3:
+                    continue
+                boundary = self._extract_alpha_shape(cluster)
+                if len(boundary) >= 3:
+                    area = Polygon(boundary).area
+                    if area > 10:  # 过滤小区域
+                        all_polygons.append(boundary)
+                        print(f"    子聚类{j}面积: {area:.1f}㎡")
+        
+        # 计算总面积
+        areas = [Polygon(poly).area for poly in all_polygons]
+        total_area = sum(areas)
+        
+        print("\n=== 最终结果 ===")
+        print(f"识别到 {len(areas)} 个工作区域")
+        print(f"总面积: {total_area:.2f} 平方米 ({total_area / 666.67:.2f} 亩)")
 
-EARTH_RADIUS = 6371000  # 地球半径（米）
+        if visualize:
+            self._visualize(proj_points, groups, all_polygons)
+            
+        return areas, total_area
 
-def haversine_distance(p1, p2):
-    """计算两点间大圆距离（米）"""
-    lat1, lon1 = map(np.radians, p1)
-    lat2, lon2 = map(np.radians, p2)
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = np.sin(dlat / 2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2)**2
-    return EARTH_RADIUS * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    def _auto_spatial_grouping(self, points):
+        """使用HDBSCAN自动空间分组"""
+        if len(points) < self.group_min_size:
+            return [points]
+            
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=self.group_min_size,
+            min_samples=self.group_cluster_size,
+            cluster_selection_method='eom'
+        )
+        labels = clusterer.fit_predict(points)
+        
+        # 分组并过滤噪声点（label=-1）
+        groups = []
+        for label in set(labels):
+            if label == -1:
+                continue
+            group = points[labels == label]
+            groups.append(group)
+            
+        return groups if groups else [points]
 
-def calculate_signed_angle(p1, p2, p3):
-    """计算点p1->p2->p3的转向角度（正左负右）"""
-    v1 = np.subtract(p2, p1)
-    v2 = np.subtract(p3, p2)
-    
-    if haversine_distance(p1, p2) < 1 or haversine_distance(p2, p3) < 1:
-        return 0.0
+    def _add_direction_aware_points(self, points):
+        """带方向感知的插值"""
+        if len(points) < 2:
+            return points
+            
+        extended = [points[0]]
+        for i in range(1, len(points)):
+            p0, p1 = points[i-1], points[i]
+            extended.append(p1)
+            
+            dist = np.linalg.norm(p1 - p0)
+            if dist > self.offset_distance * 1.5:
+                num = int(dist // self.offset_distance)
+                for j in range(1, num):
+                    interp = p0 + (p1 - p0) * (j/num)
+                    extended.append(interp)
+        return np.array(extended)
 
-    angle = degrees(np.arctan2(v2[1], v2[0]) - np.arctan2(v1[1], v1[0]))
-    return (angle + 360) if angle < -180 else (angle - 360) if angle > 180 else angle
+    def _density_clustering(self, points):
+        """组内精细聚类"""
+        if len(points) < self.min_points:
+            return []
+            
+        db = DBSCAN(eps=self.density_radius, min_samples=self.min_points).fit(points)
+        return [points[db.labels_ == label] for label in set(db.labels_) if label != -1]
 
-# ------------------ 核心类 ------------------
+    def _extract_alpha_shape(self, points):
+        """提取多边形边界"""
+        polygon = alphashape.alphashape(points, self.alpha)
+        if polygon.geom_type == 'Polygon':
+            simplified = polygon.simplify(self.simplify_tolerance, preserve_topology=True)
+            return np.array(simplified.exterior.coords)
+        return []
 
-class TrajectoryAnalyzer:
-    def __init__(self, points):
-        """初始化，输入为经度在前或字符串格式的轨迹点"""
-        self.raw_points = np.array(points)
-        self.points = self._normalize_points(points)
-        self.angles = self._calculate_angles()
-        self.segments = []
+    def _visualize(self, all_points, groups, polygons):
+        """增强可视化"""
+        plt.figure(figsize=(15, 10))
+        
+        # 绘制所有点
+        plt.scatter(all_points[:,0], all_points[:,1], 
+                   c='gray', s=5, alpha=0.1, label='所有轨迹点')
+        
+        # 绘制分组结果
+        colors = plt.cm.tab20(np.linspace(0, 1, len(groups)))
+        for i, (group, color) in enumerate(zip(groups, colors), 1):
+            plt.scatter(group[:,0], group[:,1], 
+                       c=[color], s=20, alpha=0.6, label=f'空间组{i}')
+        
+        # 绘制多边形
+        for i, poly in enumerate(polygons, 1):
+            poly_obj = Polygon(poly)
+            x, y = poly_obj.exterior.xy
+            plt.plot(x, y, 'k-', linewidth=2, label=f'作业区{i}' if i==1 else "")
+            plt.fill(x, y, alpha=0.2)
+            
+            centroid = poly_obj.centroid
+            plt.text(centroid.x, centroid.y,
+                    f'{poly_obj.area:.0f}㎡\n({poly_obj.area/666.67:.1f}亩)',
+                    ha='center', va='center',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        plt.title('空间自动分组结果', fontsize=16)
+        plt.xlabel('X (m)')
+        plt.ylabel('Y (m)')
+        plt.legend(loc='center left', bbox_to_anchor=(1.05, 0.5))
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
 
-    def _normalize_points(self, points):
-        """标准化为纬度在前格式 [lat, lon]"""
-        normed = []
-        for p in points:
-            lon, lat = (float(p[0]), float(p[1])) if isinstance(p[0], str) else (p[0], p[1])
-            normed.append([lat, lon])
-        return np.array(normed)
-
-    def _calculate_angles(self):
-        """预计算每个中间点的转向角"""
-        return [
-            calculate_signed_angle(self.points[i - 1], self.points[i], self.points[i + 1])
-            for i in range(1, len(self.points) - 1)
-        ]
-
-    def analyze_segment(self, start, end):
-        """分析子段的转向统计信息"""
-        segment = self.points[start:end + 1]
-        left, right, pattern = 0, 0, []
-
-        for i in range(len(segment) - 2):
-            angle = calculate_signed_angle(segment[i], segment[i + 1], segment[i + 2])
-            if angle > 0:
-                left += angle
-                pattern.append('L')
-            elif angle < 0:
-                right += abs(angle)
-                pattern.append('R')
-
-        return {
-            'left_total': left,
-            'right_total': right,
-            'net_rotation': left - right,
-            'turning_pattern': ''.join(pattern),
-            'segment_length': haversine_distance(segment[0], segment[-1])
-        }
-
-    def detect_u_turns(self, window=5, min_rotation=150):
-        """检测掉头区域"""
-        result = []
-        for i in range(len(self.points) - window):
-            analysis = self.analyze_segment(i, i + window - 1)
-            dominant = max(analysis['left_total'], analysis['right_total']) / (analysis['left_total'] + analysis['right_total'] + 1e-6)
-            pattern = analysis['turning_pattern']
-
-            if abs(analysis['net_rotation']) > min_rotation and dominant > 0.7 and ('LLL' in pattern or 'RRR' in pattern):
-                result.append({
-                    'indices': (i, i + window - 1),
-                    'center_point': self.points[i + window // 2],
-                    'analysis': analysis
-                })
-        return result
-
-    def segment_by_u_turns(self):
-        """根据掉头点分段轨迹"""
-        u_turns = self.detect_u_turns()
-        if not u_turns:
-            return [self.points]
-
-        segments, last = [], 0
-        for turn in u_turns:
-            start = turn['indices'][0]
-            if start > last:
-                segments.append(self.points[last:start + 1])
-            last = turn['indices'][1]
-        if last < len(self.points):
-            segments.append(self.points[last:])
-        self.segments = segments
-        return segments
-
-    def calculate_curvature(self):
-        """简单曲率指标：连续转向角绝对值差"""
-        return [
-            abs(self.angles[i+1] - self.angles[i])
-            for i in range(len(self.angles) - 1)
-        ]
-
-    def find_straight_segments(self, window=5, max_deviation=10):
-        """寻找近似直线段"""
-        straight_segments = []
-        for i in range(len(self.angles) - window):
-            window_angles = self.angles[i:i + window]
-            if max(abs(a) for a in window_angles) < max_deviation:
-                straight_segments.append({'indices': (i, i + window)})
-        return straight_segments
-
-# ------------------ 可视化 ------------------
-
-def enhanced_visualization(analyzer: TrajectoryAnalyzer):
-    """综合轨迹图示"""
-    plt.figure(figsize=(16, 12))
-
-    # 轨迹基础图
-    ax1 = plt.subplot2grid((3, 3), (0, 0), colspan=2, rowspan=2)
-    lons, lats = analyzer.raw_points[:, 0], analyzer.raw_points[:, 1]
-    ax1.plot(lons, lats, 'k-', alpha=0.5, label='轨迹')
-
-    # 掉头点标记
-    for turn in analyzer.detect_u_turns():
-        lat, lon = turn['center_point']
-        ax1.plot(lon, lat, '*', color='purple', markersize=12, label='掉头点')
-
-    # 直线段标记
-    for seg in analyzer.find_straight_segments():
-        seg_pts = analyzer.points[seg['indices'][0]:seg['indices'][1] + 1]
-        ax1.plot(seg_pts[:, 1], seg_pts[:, 0], 'g-', linewidth=3, alpha=0.7, label='直线段')
-
-    ax1.set_title('轨迹特征识别')
-    ax1.set_xlabel('经度')
-    ax1.set_ylabel('纬度')
-    ax1.legend()
-
-    # 转向角度图
-    ax2 = plt.subplot2grid((3, 3), (2, 0), colspan=3)
-    angles = analyzer.angles
-    ax2.plot(range(1, len(analyzer.points) - 1), angles, 'b-', label='瞬时转向角')
-
-    for i, a in enumerate(angles):
-        if abs(a) > 30:
-            ax2.plot(i + 1, a, 'ro')
-
-    ax2.axhline(0, color='k', linestyle='--')
-    ax2.set_title('转向角度')
-    ax2.set_xlabel('点序号')
-    ax2.set_ylabel('角度')
-    ax2.legend()
-
-    # 曲率图
-    ax3 = plt.subplot2grid((3, 3), (0, 2), rowspan=2)
-    curvature = analyzer.calculate_curvature()
-    ax3.plot(curvature, 'g-', label='曲率')
-    for i, c in enumerate(curvature):
-        if c > np.percentile(curvature, 90):
-            ax3.plot(i, c, 'ro')
-
-    ax3.set_title('轨迹曲率')
-    ax3.set_xlabel('点序号')
-    ax3.set_ylabel('曲率')
-    ax3.legend()
-
-    plt.tight_layout()
-    plt.show()
-
-if __name__ == '__main__':
-    # 示例轨迹数据（经度在前，纬度在后）
+if __name__ == "__main__":
     from getData import getData
-    sample_points = getData("data/bug.json")
+    # test_points = getData("data/test1.json")
+    # test_points = getData("data/13885004840-11.json")
+    # test_points = getData("data/13800002122-14.json")
+    # test_points = getData("data/13800002122-15 copy.json")
+    # test_points = getData("data/13800002122-15.json")
+    test_points = getData("data/2134.json")
+    print(f"加载到 {len(test_points)} 个测试点")
     
-    # 初始化分析器
-    analyzer = TrajectoryAnalyzer(sample_points)
+    calculator = AutoSpatialGrouper(
+        group_min_size=50,      # 空间组最小点数
+        group_cluster_size=30,  # 空间组密度参数
+        density_radius=5,       # 子聚类半径(米)
+        min_points=13,          # 子聚类最小点数
+        alpha=0.3,              # 边界紧密度
+        offset_distance=2       # 插值间距(米)
+    )
     
-    # 分段（基于掉头点）
-    segments = analyzer.segment_by_u_turns()
-
-    # 增强可视化分析
-    enhanced_visualization(analyzer)
-
-    # 或者使用更简单的可视化版本
-    # plot_trajectory_analysis(analyzer)
+    areas, total = calculator.calculate_work_areas(test_points, visualize=True)

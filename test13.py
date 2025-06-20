@@ -1,141 +1,119 @@
-import json
-from math import atan2, degrees, hypot
-import matplotlib.pyplot as plt
 import numpy as np
-import matplotlib
+from sklearn.cluster import DBSCAN
+from shapely.geometry import Polygon
+import alphashape
+import matplotlib.pyplot as plt
 from pyproj import Transformer
-
-
+import hdbscan
+import matplotlib
 matplotlib.rcParams['font.sans-serif'] = ['PingFang HK', 'Arial Unicode MS', 'SimHei']
 matplotlib.rcParams['axes.unicode_minus'] = False
 
+class AutoGroupAreaCalculator:
+    def __init__(self, min_cluster_size=30, density_radius=5, min_points=20, alpha=0.05,
+                 simplify_tolerance=2.0):
+        self.transformer = Transformer.from_crs("EPSG:4326", "EPSG:3410", always_xy=True)
+        self.min_cluster_size = min_cluster_size
+        self.density_radius = density_radius
+        self.min_points = min_points
+        self.alpha = alpha
+        self.simplify_tolerance = simplify_tolerance
 
-def load_data(path):
-    from getData import getData
-    raw = getData(path)
-    # 转换为 (纬度, 经度)
-    return [(lat, lon) for lon, lat in raw if isinstance(lat, float) and isinstance(lon, float)]
+    def calculate_work_areas(self, points, visualize=False):
+        proj_points = np.array([self.transformer.transform(lon, lat) for lon, lat in points])
 
+        # 用HDBSCAN先做大组分组
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=50,       # 主要调大这个（原300）
+            # min_samples=200,             # 次要调大（原5）
+            cluster_selection_epsilon=5, # 允许合并5米内的簇（原0）
+            cluster_selection_method='eom' # 保持使用EOM方法
+            )
+        hdb_labels = clusterer.fit_predict(proj_points)
+        print(f"一共分了{len(hdb_labels)}组")
+        polygons = []
+        for label in set(hdb_labels):
+            if label == -1:
+                continue
+            group_points = proj_points[hdb_labels == label]
+            if len(group_points) < self.min_points:
+                continue
 
-def calculate_angle(a, b, c):
-    ba_x, ba_y = a[0] - b[0], a[1] - b[1]
-    bc_x, bc_y = c[0] - b[0], c[1] - b[1]
-    angle = degrees(atan2(ba_x * bc_y - ba_y * bc_x, ba_x * bc_x + ba_y * bc_y))
-    return abs(angle)
+            # 每组用DBSCAN做细聚类
+            db = DBSCAN(eps=self.density_radius, min_samples=self.min_points).fit(group_points)
+            for db_label in set(db.labels_):
+                if db_label == -1:
+                    continue
+                cluster = group_points[db.labels_ == db_label]
 
+                if len(cluster) < 3:
+                    continue
 
-def find_turning_zones(points, angle_threshold=20, window_size=3):
-    zones = []
-    current = []
-    for i in range(1, len(points) - 1):
-        angle = calculate_angle(points[i - 1], points[i], points[i + 1])
-        if abs(180 - angle) > angle_threshold:
-            current.append(i)
-        else:
-            if len(current) >= window_size:
-                zones.append((current[0], current[-1]))
-            current = []
-    if len(current) >= window_size:
-        zones.append((current[0], current[-1]))
-    return zones
+                boundary_points = self._extract_alpha_shape(cluster)
+                if len(boundary_points) >= 3:
+                    polygons.append(boundary_points)
 
+        areas = []
+        valid_polygons = []
+        for poly in polygons:
+            area = Polygon(poly).area
+            if area > 10:
+                areas.append(area)
+                valid_polygons.append(poly)
 
-def extract_work_segments(points, turning_zones):
-    if not turning_zones:
+        if visualize:
+            self._visualize(proj_points, valid_polygons)
+
+        return areas, sum(areas)
+
+    def _extract_alpha_shape(self, points):
+        polygon = alphashape.alphashape(points, self.alpha)
+        if polygon and polygon.geom_type == 'Polygon':
+            simplified = polygon.simplify(self.simplify_tolerance, preserve_topology=True)
+            return np.array(simplified.exterior.coords)
         return []
-    boundaries = [0] + [z[1] for z in turning_zones] + [len(points) - 1]
-    boundaries = sorted(set(boundaries))
-    segments = []
-    for i in range(len(boundaries) - 1):
-        start, end = boundaries[i], boundaries[i + 1]
-        if end - start >= 3:
-            segments.append(points[start:end + 1])
-    return segments
+
+    def _visualize(self, original_points, polygons):
+        plt.figure(figsize=(12, 8))
+        plt.scatter(original_points[:, 0], original_points[:, 1], c='red', s=30, alpha=0.8, label='原始点')
+
+        for i, poly in enumerate(polygons):
+            polygon = Polygon(poly)
+            x, y = polygon.exterior.xy
+            plt.plot(x, y, linewidth=2, label=f'区域{i + 1}')
+            plt.fill(x, y, alpha=0.2)
+
+            centroid = polygon.centroid
+            plt.text(centroid.x, centroid.y,
+                     f'{polygon.area:.0f}㎡\n({polygon.area / 666.67:.1f}亩)',
+                     ha='center', va='center',
+                     bbox=dict(facecolor='white', alpha=0.8))
+
+        plt.title('工作区域识别（HDBSCAN + DBSCAN自动分组）')
+        plt.xlabel('X (m)')
+        plt.ylabel('Y (m)')
+        plt.grid(True, alpha=0.3)
+        plt.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), borderaxespad=0.)
+        plt.tight_layout(rect=[0, 0, 0.85, 1])
+        plt.show()
 
 
-def segment_direction(segment):
-    if len(segment) < 2:
-        return None
-    dx = segment[-1][1] - segment[0][1]
-    dy = segment[-1][0] - segment[0][0]
-    return degrees(atan2(dy, dx))
-
-
-def group_similar_direction_segments(segments, angle_diff_thresh=25):
-    """
-    将连续角度相近的作业段分为同一田块
-    """
-    grouped = []
-    current_group = []
-    last_dir = None
-
-    for seg in segments:
-        angle = segment_direction(seg)
-        if angle is None:
-            continue
-        if not current_group:
-            current_group.append(seg)
-            last_dir = angle
-        else:
-            if abs(angle - last_dir) < angle_diff_thresh:
-                current_group.append(seg)
-                last_dir = angle
-            else:
-                grouped.append(current_group)
-                current_group = [seg]
-                last_dir = angle
-
-    if current_group:
-        grouped.append(current_group)
-    return grouped
-
-
-def visualize(all_points, grouped_segments):
-    plt.figure(figsize=(10, 8))
-    lons = [p[1] for p in all_points]
-    lats = [p[0] for p in all_points]
-    plt.plot(lons, lats, color='gray', linewidth=0.5, label='原始轨迹')
-
-    colors = plt.cm.get_cmap('tab10', 10)
-    for i, group in enumerate(grouped_segments):
-        for seg in group:
-            lat = [p[0] for p in seg]
-            lon = [p[1] for p in seg]
-            plt.plot(lon, lat, linewidth=2, color=colors(i), label=f"田块组 {i}" if seg == group[0] else "")
-
-    plt.title("基于规则识别的农机作业田块")
-    plt.xlabel("经度")
-    plt.ylabel("纬度")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
-
-
+# 测试调用
 if __name__ == "__main__":
     from getData import getData
-    test_points = getData("data/2134.json")
-    test_points = [[float(i[0]),float(i[1])] for i in test_points]
-    print(f"✅ 原始点数：{len(test_points)}")
 
-    turning_zones = find_turning_zones(test_points)
-    print(f"✅ 掉头区域数：{len(turning_zones)}")
+    test_points = getData("data/13800002122-15.json")
 
-    work_segments = extract_work_segments(test_points, turning_zones)
-    print(f"✅ 作业段数：{len(work_segments)}")
+    calculator = AutoGroupAreaCalculator(
+        min_cluster_size=30,
+        density_radius=5,
+        min_points=15,
+        alpha=0.3,
+        simplify_tolerance=2
+    )
 
-    valid_segments = []
-    for seg in work_segments:
-        if len(seg) < 2:
-            continue
-        angle = segment_direction(seg)
-        if angle is None:
-            continue
-        length = hypot(seg[-1][1] - seg[0][1], seg[-1][0] - seg[0][0])
-        if length > 0.0001:
-            valid_segments.append(seg)
+    areas, total = calculator.calculate_work_areas(test_points, visualize=True)
 
-    grouped = group_similar_direction_segments(valid_segments)
-    print(f"✅ 有效田块组数量: {len(grouped)}")
-
-    visualize(test_points, grouped)
+    print(f"识别到 {len(areas)} 个工作区域")
+    print(f"各区域面积（平方米）: {areas}")
+    print(f"总面积: {total:.2f} 平方米 ({total / 666.67:.2f} 亩)")

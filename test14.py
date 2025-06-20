@@ -1,142 +1,181 @@
+import numpy as np
+from sklearn.cluster import DBSCAN
+from shapely.geometry import Polygon
+import alphashape
 import matplotlib.pyplot as plt
-import random
-from math import atan2, degrees
 import matplotlib
 from pyproj import Transformer
-
-
+import hdbscan
 matplotlib.rcParams['font.sans-serif'] = ['PingFang HK', 'Arial Unicode MS', 'SimHei']
 matplotlib.rcParams['axes.unicode_minus'] = False
 
-def calculate_turning_angle(p1, p2, p3):
-    """计算三点形成的转角（0-180度）"""
-    # 向量AB (lon变化, lat变化)
-    v1 = (p2[1]-p1[1], p2[0]-p1[0])
-    # 向量BC
-    v2 = (p3[1]-p2[1], p3[0]-p2[0])
-    
-    # 计算夹角（使用atan2避免数值问题）
-    dot = v1[0]*v2[0] + v1[1]*v2[1]
-    cross = v1[0]*v2[1] - v1[1]*v2[0]
-    angle_rad = atan2(abs(cross), dot)
-    return degrees(angle_rad)
 
-def segment_track(points, window_size=6, angle_threshold=150):
-    """基于滑动窗口总转角的分割算法"""
-    if len(points) < window_size:
-        return [points]
-    
-    segments = []
-    split_positions = []
-    
-    # 第一轮：检测所有潜在分割点
-    for i in range(len(points) - window_size + 1):
-        window_points = points[i:i+window_size]
-        total_angle = 0
-        
-        for j in range(len(window_points)-2):
-            angle = calculate_turning_angle(window_points[j], 
-                                          window_points[j+1], 
-                                          window_points[j+2])
-            total_angle += angle
-        
-        if total_angle > angle_threshold:
-            print(f"窗口里面的GPS：{window_points}")
-            split_pos = i + (window_size // 2)
-            if split_pos not in split_positions:
-                split_positions.append(split_pos)
-    
-    # 处理分割点
-    if not split_positions:
-        return [points]
-    
-    split_positions.sort()
-    prev_pos = 0
-    for pos in split_positions:
-        if pos > prev_pos and pos < len(points):
-            segments.append(points[prev_pos:pos+1])
-            prev_pos = pos
-    
-    if prev_pos < len(points):
-        segments.append(points[prev_pos:])
-    
-    return segments
+class OptimizedAreaCalculator:
+    def __init__(self, density_radius=5, min_points=20, alpha=0.05,
+                 simplify_tolerance=2.0, offset_distance=3,
+                 extend_main_direction=True, extend_other_directions=True):
+        self.transformer = Transformer.from_crs("EPSG:4326", "EPSG:3410", always_xy=True)
+        self.density_radius = density_radius
+        self.min_points = min_points
+        self.alpha = alpha
+        self.simplify_tolerance = simplify_tolerance
+        self.offset_distance = offset_distance
 
-def generate_random_color():
-    """生成鲜艳的随机颜色"""
-    return (random.random(), random.random(), random.random())
+        self.extend_main_direction = extend_main_direction
+        self.extend_other_directions = extend_other_directions
 
-def visualize(points, segments):
-    """改进的可视化函数"""
-    plt.figure(figsize=(12, 8), dpi=100)
-    
-    # 绘制所有原始点（半透明）
-    lons, lats = zip(*points)
-    plt.plot(lons, lats, 'ko', markersize=3, alpha=0.3, label='GPS点')
-    
-    # 绘制每个线段（不同颜色）
-    for i, seg in enumerate(segments):
-        seg_lons, seg_lats = zip(*seg)
-        color = generate_random_color()
-        
-        # 主线段
-        plt.plot(seg_lons, seg_lats, 
-                color=color,
-                linewidth=3,
-                marker='o',
-                markersize=5,
-                markeredgecolor='k',
-                label=f'线段{i+1}')
-        
-        # 线段起点标记
-        plt.plot(seg_lons[0], seg_lats[0], 
-                'o', color=color, markersize=8)
-        
-        # 线段终点标记（如果是分割点）
-        if i < len(segments)-1:
-            plt.plot(seg_lons[-1], seg_lats[-1], 
-                    'rx', markersize=12, mew=2)
-    
-    # 自动调整坐标范围（增加5%边距）
-    min_lon, max_lon = min(lons), max(lons)
-    min_lat, max_lat = min(lats), max(lats)
-    lon_margin = (max_lon - min_lon) * 0.05
-    lat_margin = (max_lat - min_lat) * 0.05
-    
-    plt.xlim(min_lon - lon_margin, max_lon + lon_margin)
-    plt.ylim(min_lat - lat_margin, max_lat + lat_margin)
-    
-    plt.title(f"轨迹分割结果（共{len(segments)}段）", fontsize=14)
-    plt.xlabel("经度", fontsize=12)
-    plt.ylabel("纬度", fontsize=12)
-    plt.grid(True, linestyle='--', alpha=0.5)
-    
-    # 优化图例显示
-    handles, labels = plt.gca().get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    plt.legend(by_label.values(), by_label.keys(), 
-              loc='best',
-              fontsize=10,
-              framealpha=0.8)
-    
-    plt.tight_layout()
-    plt.show()
+        self.base_directions = np.array([
+            [1, 0], [0, 1], [-1, 0], [0, -1],
+            [1, 1], [-1, -1], [1, -1], [-1, 1]
+        ])
+        self.norm_directions = self.base_directions / np.linalg.norm(self.base_directions, axis=1, keepdims=True)
 
+    def calculate_work_areas(self, points, visualize=False):
+        proj_points = np.array([self.transformer.transform(lon, lat) for lon, lat in points])
+        extended_points = self._add_direction_aware_points(proj_points)
+        clusters = self._density_clustering(extended_points)
 
+        polygons = []
+        for cluster in clusters:
+            if len(cluster) < 3:
+                continue
+            boundary_points = self._extract_alpha_shape(cluster)
+            if len(boundary_points) >= 3:
+                polygons.append(boundary_points)
 
+        areas = []
+        valid_polygons = []
+        for poly in polygons:
+            area = Polygon(poly).area
+            if area > 10:
+                areas.append(area)
+                valid_polygons.append(poly)
+
+        if visualize:
+            self._visualize(proj_points, extended_points, valid_polygons)
+
+        return areas, sum(areas)
+
+    def _get_dominant_direction(self, vec):
+        norm_vec = vec / (np.linalg.norm(vec) + 1e-6)
+        similarities = self.norm_directions @ norm_vec
+        idx = np.argmax(similarities)
+        return self.norm_directions[idx], similarities[idx]
+
+    def _add_direction_aware_points(self, points, angle_cos_threshold=0.96, max_gap=3.0):
+        extended = []
+        extended.append(points[0])  # 首点保留
+
+        for i in range(1, len(points) - 1):
+            p0, p1, p2 = points[i - 1], points[i], points[i + 1]
+            v1 = p1 - p0
+            v2 = p2 - p1
+
+            norm1 = np.linalg.norm(v1)
+            norm2 = np.linalg.norm(v2)
+
+            if norm1 < 1e-6 or norm2 < 1e-6:
+                extended.append(p1)
+                continue
+
+            cos_angle = np.dot(v1, v2) / (norm1 * norm2)
+
+            extended.append(p1)
+
+            # 如果方向一致，且中间距离太大，插值
+            if cos_angle > angle_cos_threshold:
+                total_dist = np.linalg.norm(p2 - p0)
+                if total_dist > max_gap:
+                    num_extra = int(total_dist // self.offset_distance)
+                    direction = (p2 - p0) / total_dist
+                    for j in range(1, num_extra):
+                        interp_point = p0 + direction * j * self.offset_distance
+                        extended.append(interp_point)
+
+        extended.append(points[-1])  # 末点保留
+        return np.array(extended)
+    
+    def _density_clustering(self, points):
+        # 第一步：先用 HDBSCAN 粗分组
+        hdb = hdbscan.HDBSCAN(min_cluster_size=300)
+        hdb_labels = hdb.fit_predict(points)
+
+        clusters = []
+        for label in set(hdb_labels):
+            if label == -1:
+                continue  # 忽略噪声点
+
+            # 拿出当前 HDBSCAN 子集
+            sub_points = points[hdb_labels == label]
+
+            # 第二步：对每个子集再用 DBSCAN 做细聚类
+            db = DBSCAN(eps=self.density_radius, min_samples=self.min_points).fit(sub_points)
+            for db_label in set(db.labels_):
+                if db_label == -1:
+                    continue
+                final_cluster = sub_points[db.labels_ == db_label]
+                clusters.append(final_cluster)
+
+        return clusters
+    def _extract_alpha_shape(self, points):
+        polygon = alphashape.alphashape(points, self.alpha)
+        if polygon and polygon.geom_type == 'Polygon':
+            simplified = polygon.simplify(self.simplify_tolerance, preserve_topology=True)
+            return np.array(simplified.exterior.coords)
+        return []
+
+    def _visualize(self, original_points, extended_points, polygons):
+        plt.figure(figsize=(12, 8))
+
+        plt.scatter(original_points[:, 0], original_points[:, 1],
+                    c='red', s=30, alpha=0.8, label='原始点')
+        plt.scatter(extended_points[:, 0], extended_points[:, 1],
+                    c='gray', s=5, alpha=0.4, label='扩展点')
+
+        for i, poly in enumerate(polygons):
+            polygon = Polygon(poly)
+            x, y = polygon.exterior.xy
+            plt.plot(x, y, linewidth=2, label=f'区域{i + 1}')
+            plt.fill(x, y, alpha=0.2)
+
+            centroid = polygon.centroid
+            plt.text(centroid.x, centroid.y,
+                     f'{polygon.area:.0f}㎡\n({polygon.area / 666.67:.1f}亩)',
+                     ha='center', va='center',
+                     bbox=dict(facecolor='white', alpha=0.8))
+
+        plt.title('工作区域识别（方向感知扩展）')
+        plt.xlabel('X (m)')
+        plt.ylabel('Y (m)')
+        plt.grid(True, alpha=0.3)
+
+        # ⭐ 图例放到图外
+        plt.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), borderaxespad=0.)
+        plt.tight_layout(rect=[0, 0, 0.85, 1])
+        plt.show()
+    
 if __name__ == "__main__":
-    # 测试轨迹
     from getData import getData
-    test_points = getData(r"data/线段测试.json")
-    test_points = [ [float(p[1]),float(p[0])] for p in test_points]
-    # 执行分割算法
-    segments = segment_track(test_points, window_size=6, angle_threshold=150)
-    
-    # 输出分割结果
-    print(f"原始点数：{len(test_points)}")
-    print(f"分割段数：{len(segments)}")
-    # for i, seg in enumerate(segments):
-    #     print(f"线段{i+1}: {len(seg)}个点 | 起点：{seg[0]} | 终点：{seg[-1]}")
-    
-    # 可视化
-    visualize(test_points, segments)
+
+    # test_points = getData("data/test1.json")
+    # test_points = getData("data/13885004840-11.json")
+    # test_points = getData("data/13800002122-14.json")
+    # test_points = getData("data/13800002122-15 copy.json")
+    test_points = getData("data/13800002122-15.json")
+    # test_points = getData("data/2134.json")
+
+    calculator = OptimizedAreaCalculator(
+        density_radius=5,
+        min_points=15,
+        alpha=0.3,
+        simplify_tolerance=2,
+        offset_distance=2,
+        extend_main_direction=False,
+        extend_other_directions=False  # 🚨只启用主方向扩展，关闭其他方向插值
+    )
+
+    areas, total = calculator.calculate_work_areas(test_points, visualize=True)
+
+    print(f"识别到 {len(areas)} 个工作区域")
+    print(f"各区域面积（平方米）: {areas}")
+    print(f"总面积: {total:.2f} 平方米 ({total / 666.67:.2f} 亩)")

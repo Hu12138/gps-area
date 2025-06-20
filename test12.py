@@ -5,7 +5,7 @@ import alphashape
 import matplotlib.pyplot as plt
 import matplotlib
 from pyproj import Transformer
-
+import hdbscan
 matplotlib.rcParams['font.sans-serif'] = ['PingFang HK', 'Arial Unicode MS', 'SimHei']
 matplotlib.rcParams['axes.unicode_minus'] = False
 
@@ -145,10 +145,12 @@ class OptimizedAreaCalculator:
 if __name__ == "__main__":
     from getData import getData
 
-    test_points = getData("data/test1.json")
+    # test_points = getData("data/test1.json")
     # test_points = getData("data/13885004840-11.json")
     # test_points = getData("data/13800002122-14.json")
-    # test_points = getData("data/2134.json")
+    # test_points = getData("data/13800002122-15 copy.json")
+    # test_points = getData("data/13800002122-15.json")
+    test_points = getData("data/2134.json")
 
     calculator = OptimizedAreaCalculator(
         density_radius=5,
