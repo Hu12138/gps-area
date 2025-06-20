@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 COPY main.py .
 
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.doubanio.com/simple
 
 # 设置默认环境变量（可在 docker run 时覆盖）
 ENV GUNICORN_WORKERS=4
