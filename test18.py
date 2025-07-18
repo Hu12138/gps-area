@@ -249,10 +249,13 @@ class TrajectoryProcessor:
 if __name__ == "__main__":
     processor = TrajectoryProcessor()
     
-    # 加载数据
+    # # 加载数据
     data = processor.get_data("data/13800002143-15-t-s.json")
-    data = processor.get_data("data/13885004840-11-t-s.json")
-    data = processor.get_data("data/13800002122-15-t-s.txt")
+    # data = processor.get_data("data/13885004840-11-t-s.json")
+    # data = processor.get_data("data/13800002122-15-t-s.txt")
+    # data = processor.get_data("data/13800002141-0714.txt")
+    # data = processor.get_data("data/13800002141-0715.txt")
+    # data = processor.get_data("data/13800002143-0715.txt")
     print(f"加载到原始 {len(data)} 个测试点")
     
     # 过滤公路轨迹段
@@ -263,10 +266,11 @@ if __name__ == "__main__":
     areas, total = processor.calculate_work_areas(
         filtered_points, 
         visualize=True,
-        group_min_size=50,
+        group_min_size=200,
         group_cluster_size=30,
         density_radius=5,
         min_points=13,
         alpha=0.3,
         offset_distance=2
     )
+    # print("Polygons count:", len(polygons))

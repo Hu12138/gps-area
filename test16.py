@@ -89,7 +89,8 @@ def plot_linear_segments(points, linear_segments):
     plt.show()
 
 if __name__ == "__main__":
-    data = getData("data/13800002143-15-t-s.json")
+    # data = getData("data/13800002143-15-t-s.json")
+    data = getData("data/13800002122-15-t-s.txt")
     print(f"加载到原始 {len(data)} 个测试点")
 
     linear_segments = identify_linear_segments(data)
